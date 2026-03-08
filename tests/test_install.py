@@ -40,6 +40,7 @@ def run(
 
 def wait_for_systemd_user(timeout: int = 30):
     """Wait until systemd --user is ready."""
+    state = ""
     for _ in range(timeout):
         r = run("systemctl --user is-system-running", check=False)
         state = r.stdout.strip()
@@ -49,8 +50,28 @@ def wait_for_systemd_user(timeout: int = 30):
     raise RuntimeError(f"systemd --user did not reach running state, got: {state}")
 
 
+def assert_clean_state(tc: unittest.TestCase):
+    """Assert that kiro-gateway is fully uninstalled with zero residue."""
+    tc.assertFalse(SERVICE_FILE.exists(), "Service file should be removed")
+    tc.assertFalse(INSTALL_DIR.exists(), "Install directory should be removed")
+
+    r = run(f"systemctl --user is-enabled {SERVICE_NAME}", check=False)
+    tc.assertNotEqual(r.stdout.strip(), "enabled", "Service should not be enabled")
+
+    r = run(f"systemctl --user is-active {SERVICE_NAME}", check=False)
+    tc.assertNotEqual(r.stdout.strip(), "active", "Service should not be active")
+
+    r = run(f"systemctl --user cat {SERVICE_NAME}", check=False)
+    tc.assertNotEqual(r.returncode, 0, "systemctl cat should fail (unit not found)")
+
+    tc.assertFalse(
+        Path("/tmp/kiro-gateway-env-backup").exists(),
+        "Temp .env backup should be cleaned up",
+    )
+
+
 class TestInstallRefreshToken(unittest.TestCase):
-    """Test install with option 2 (refresh token)."""
+    """Test full install → verify → uninstall cycle with option 2 (refresh token)."""
 
     @classmethod
     def setUpClass(cls):
@@ -115,7 +136,7 @@ class TestInstallRefreshToken(unittest.TestCase):
             self.assertIn(directive, content, f"Service file should contain {directive}")
 
     def test_08_uninstall(self):
-        """Run uninstaller."""
+        """Run uninstaller and verify zero residue."""
         # Input: sure=y, keep .env=n
         stdin = "y\nn\n"
         result = run("python3 /workspace/install.py --uninstall", input_text=stdin, check=False)
@@ -124,32 +145,15 @@ class TestInstallRefreshToken(unittest.TestCase):
 
     def test_09_cleaned_up(self):
         """Verify everything was removed — zero residue."""
-        # Service file removed
-        self.assertFalse(SERVICE_FILE.exists(), "Service file should be removed")
-
-        # Install directory completely gone (no .env backup left behind)
-        self.assertFalse(INSTALL_DIR.exists(), "Install directory should be removed")
-
-        # systemd no longer knows about the service
-        result = run(f"systemctl --user is-enabled {SERVICE_NAME}", check=False)
-        self.assertNotEqual(result.stdout.strip(), "enabled", "Service should not be enabled")
-
-        result = run(f"systemctl --user is-active {SERVICE_NAME}", check=False)
-        self.assertNotEqual(result.stdout.strip(), "active", "Service should not be active")
-
-        # No leftover unit file in systemd search paths
-        result = run(f"systemctl --user cat {SERVICE_NAME}", check=False)
-        self.assertNotEqual(result.returncode, 0, "systemctl cat should fail (unit not found)")
-
-        # No temp backup file leaked
-        self.assertFalse(
-            Path("/tmp/kiro-gateway-env-backup").exists(),
-            "Temp .env backup should be cleaned up",
-        )
+        assert_clean_state(self)
 
 
 class TestCredsPathExpansion(unittest.TestCase):
     """Test that ~ in credential paths gets expanded to absolute paths."""
+
+    @classmethod
+    def setUpClass(cls):
+        wait_for_systemd_user()
 
     def test_10_install_with_tilde_path(self):
         """Install using option 1 with a ~ path and verify expansion."""
@@ -182,23 +186,15 @@ class TestCredsPathExpansion(unittest.TestCase):
                 )
                 break
 
-    def test_12_cleanup(self):
+    def test_12_uninstall_and_verify(self):
         """Uninstall and verify zero residue."""
+        # Input: sure=y, keep .env=n
         stdin = "y\nn\n"
         result = run("python3 /workspace/install.py --uninstall", input_text=stdin, check=False)
         print("=== CREDS PATH UNINSTALL STDOUT ===")
         print(result.stdout)
 
-        self.assertFalse(SERVICE_FILE.exists(), "Service file should be removed")
-        self.assertFalse(INSTALL_DIR.exists(), "Install directory should be removed")
-
-        r = run(f"systemctl --user is-active {SERVICE_NAME}", check=False)
-        self.assertNotEqual(r.stdout.strip(), "active")
-
-        r = run(f"systemctl --user cat {SERVICE_NAME}", check=False)
-        self.assertNotEqual(r.returncode, 0, "Unit should not exist in systemd")
-
-        self.assertFalse(Path("/tmp/kiro-gateway-env-backup").exists())
+        assert_clean_state(self)
 
 
 if __name__ == "__main__":
