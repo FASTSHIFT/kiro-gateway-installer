@@ -59,7 +59,7 @@ install.py
 ### Install
 
 ```bash
-git clone --recurse-submodules https://github.com/YOUR_USERNAME/kiro-gateway-installer.git
+git clone --recurse-submodules https://github.com/FASTSHIFT/kiro-gateway-installer.git
 cd kiro-gateway-installer
 sudo python3 install.py
 ```
