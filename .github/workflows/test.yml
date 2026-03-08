@@ -1,0 +1,66 @@
+name: Test Installer
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install black ruff
+      - run: bash format.sh --check
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build systemd test image
+        run: docker build -f tests/Dockerfile.systemd -t kiro-gateway-installer-test .
+
+      - name: Start systemd container
+        run: |
+          docker run -d \
+            --name kiro-gw-test \
+            --privileged \
+            --cgroupns=host \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            kiro-gateway-installer-test
+
+      - name: Wait for systemd
+        run: |
+          for i in $(seq 1 30); do
+            state=$(docker exec kiro-gw-test systemctl is-system-running 2>/dev/null || true)
+            echo "Attempt $i: $state"
+            if [ "$state" = "running" ] || [ "$state" = "degraded" ]; then
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run tests
+        run: docker exec kiro-gw-test python3 -m pytest /workspace/tests/test_install.py -v --tb=short
+
+      - name: Show logs on failure
+        if: failure()
+        run: |
+          echo "=== journalctl ==="
+          docker exec kiro-gw-test journalctl -u kiro-gateway --no-pager -n 50 || true
+          echo "=== service file ==="
+          docker exec kiro-gw-test cat /etc/systemd/system/kiro-gateway.service || true
+          echo "=== .env ==="
+          docker exec kiro-gw-test cat /opt/kiro-gateway/.env || true
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f kiro-gw-test
