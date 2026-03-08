@@ -234,6 +234,34 @@ def step_deploy_code(python_path: str):
         fatal("Verification failed: cannot import fastapi")
     ok(f"Verified: fastapi {result.stdout.strip()}")
 
+    # Patch: Q API endpoint (q.{region}.amazonaws.com) only exists in us-east-1,
+    # but credentials files may contain other regions (e.g. ap-southeast-1).
+    # The refresh URL must still use the credentials region (auth works per-region),
+    # so we only pin api_host and q_host to us-east-1.
+    auth_py = dest_src / "kiro" / "auth.py"
+    if auth_py.exists():
+        original = auth_py.read_text()
+        old_block = (
+            "            if 'region' in data:\n"
+            "                self._region = data['region']\n"
+            "                # Update URLs for new region\n"
+            "                self._refresh_url = get_kiro_refresh_url(self._region)\n"
+            "                self._api_host = get_kiro_api_host(self._region)\n"
+            "                self._q_host = get_kiro_q_host(self._region)"
+        )
+        new_block = (
+            "            if 'region' in data:\n"
+            "                self._region = data['region']\n"
+            "                # Update refresh URLs for credential region\n"
+            "                self._refresh_url = get_kiro_refresh_url(self._region)\n"
+            "                # Pin API host to us-east-1 (Q API only exists there)\n"
+            "                self._api_host = get_kiro_api_host('us-east-1')\n"
+            "                self._q_host = get_kiro_q_host('us-east-1')"
+        )
+        if old_block in original:
+            auth_py.write_text(original.replace(old_block, new_block, 1))
+            ok("Patched: API host pinned to us-east-1, refresh URL uses credential region")
+
 
 # ── Step 3: Interactive configuration ─────────────────────────────────────────
 
@@ -638,9 +666,11 @@ def hello():
     if len(models) > 10:
         print(f"    {C.DIM}... and {len(models) - 10} more{C.RESET}")
 
-    # Pick model
+    # Pick model — prefer a concrete model over auto-kiro (which may 400 on non-stream)
+    concrete = [m for m in models if not m.startswith("auto")]
+    default_model = concrete[0] if concrete else models[0]
     print()
-    model = ask("Model to use", models[0])
+    model = ask("Model to use", default_model)
 
     # Send hello
     info(f"Sending 'Hello' to {model} ...")
