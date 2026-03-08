@@ -19,6 +19,10 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    env:
+      CONTAINER: kiro-gw-test
+      IMAGE: kiro-gateway-installer-test
+      TEST_USER: testuser
     steps:
       - name: Checkout with submodules
         uses: actions/checkout@v4
@@ -26,21 +30,21 @@ jobs:
           submodules: recursive
 
       - name: Build systemd test image
-        run: docker build -f tests/Dockerfile.systemd -t kiro-gateway-installer-test .
+        run: docker build -f tests/Dockerfile.systemd -t $IMAGE .
 
       - name: Start systemd container
         run: |
           docker run -d \
-            --name kiro-gw-test \
+            --name $CONTAINER \
             --privileged \
             --cgroupns=host \
             -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-            kiro-gateway-installer-test
+            $IMAGE
 
       - name: Wait for systemd
         run: |
           for i in $(seq 1 30); do
-            state=$(docker exec kiro-gw-test systemctl is-system-running 2>/dev/null || true)
+            state=$(docker exec $CONTAINER systemctl is-system-running 2>/dev/null || true)
             echo "Attempt $i: $state"
             if [ "$state" = "running" ] || [ "$state" = "degraded" ]; then
               break
@@ -48,19 +52,49 @@ jobs:
             sleep 1
           done
 
+      - name: Setup test user
+        run: |
+          docker exec $CONTAINER loginctl enable-linger $TEST_USER
+          UID_VAL=$(docker exec $CONTAINER id -u $TEST_USER)
+          echo "Test user UID: $UID_VAL"
+          # Wait for user systemd
+          for i in $(seq 1 15); do
+            state=$(docker exec --user $TEST_USER \
+              -e XDG_RUNTIME_DIR=/run/user/$UID_VAL \
+              -e DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_VAL/bus \
+              $CONTAINER systemctl --user is-system-running 2>/dev/null || true)
+            echo "User systemd attempt $i: $state"
+            if [ "$state" = "running" ] || [ "$state" = "degraded" ]; then
+              break
+            fi
+            sleep 1
+          done
+
       - name: Run tests
-        run: docker exec kiro-gw-test python3 -m pytest /workspace/tests/test_install.py -v --tb=short
+        run: |
+          UID_VAL=$(docker exec $CONTAINER id -u $TEST_USER)
+          docker exec --user $TEST_USER \
+            -e XDG_RUNTIME_DIR=/run/user/$UID_VAL \
+            -e DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_VAL/bus \
+            $CONTAINER \
+            python3 -m pytest /workspace/tests/test_install.py -v --tb=short
 
       - name: Show logs on failure
         if: failure()
         run: |
-          echo "=== journalctl ==="
-          docker exec kiro-gw-test journalctl -u kiro-gateway --no-pager -n 50 || true
+          UID_VAL=$(docker exec $CONTAINER id -u $TEST_USER)
+          echo "=== user journal ==="
+          docker exec --user $TEST_USER \
+            -e XDG_RUNTIME_DIR=/run/user/$UID_VAL \
+            -e DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_VAL/bus \
+            $CONTAINER journalctl --user-unit kiro-gateway --no-pager -n 50 || true
           echo "=== service file ==="
-          docker exec kiro-gw-test cat /etc/systemd/system/kiro-gateway.service || true
+          docker exec --user $TEST_USER $CONTAINER \
+            cat /home/$TEST_USER/.config/systemd/user/kiro-gateway.service || true
           echo "=== .env ==="
-          docker exec kiro-gw-test cat /opt/kiro-gateway/.env || true
+          docker exec --user $TEST_USER $CONTAINER \
+            cat /home/$TEST_USER/.local/share/kiro-gateway/.env || true
 
       - name: Cleanup
         if: always()
-        run: docker rm -f kiro-gw-test
+        run: docker rm -f $CONTAINER

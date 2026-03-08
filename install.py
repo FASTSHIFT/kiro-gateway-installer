@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-kiro-gateway interactive installer
-Deploys kiro-gateway as a systemd service with auto-verification and security hardening.
+kiro-gateway interactive installer (user-level)
+Deploys kiro-gateway as a systemd user service with auto-verification.
+
+No root/sudo required. Installs to ~/.local/share/kiro-gateway.
+Uses systemctl --user for service management.
 
 Usage:
-    sudo python3 install.py              # Install
-    sudo python3 install.py --uninstall  # Uninstall
+    python3 install.py              # Install
+    python3 install.py --uninstall  # Uninstall
 """
 
 import getpass
@@ -21,14 +24,15 @@ from pathlib import Path
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-INSTALL_DIR = Path("/opt/kiro-gateway")
+INSTALL_DIR = Path.home() / ".local" / "share" / "kiro-gateway"
 SERVICE_NAME = "kiro-gateway"
-SERVICE_FILE = Path(f"/etc/systemd/system/{SERVICE_NAME}.service")
-SERVICE_USER = "kiro-gateway"
+SERVICE_DIR = Path.home() / ".config" / "systemd" / "user"
+SERVICE_FILE = SERVICE_DIR / f"{SERVICE_NAME}.service"
 VENV_DIR = INSTALL_DIR / "venv"
 ENV_FILE = INSTALL_DIR / ".env"
 SCRIPT_DIR = Path(__file__).resolve().parent
 SOURCE_DIR = SCRIPT_DIR / "kiro-gateway"
+
 
 # ── Colored output ────────────────────────────────────────────────────────────
 
@@ -94,12 +98,27 @@ def run(
     return subprocess.run(cmd, check=check, capture_output=capture, text=True, **kwargs)
 
 
+def run_live(cmd: list[str], check: bool = True) -> int:
+    """Run a command with real-time stdout/stderr output. Returns exit code."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(f"    {C.DIM}{line.rstrip()}{C.RESET}")
+    proc.wait()
+    if check and proc.returncode != 0:
+        fatal(f"Command failed (exit {proc.returncode}): {' '.join(cmd)}")
+    return proc.returncode
+
+
 # ── Step 1: Environment checks ───────────────────────────────────────────────
 
 
-def check_root():
-    if os.geteuid() != 0:
-        fatal("Please run with sudo: sudo python3 install.py")
+def check_not_root():
+    if os.geteuid() == 0:
+        fatal(
+            "Do not run as root. This installer uses systemd --user services.\n"
+            "     Run as your normal user: python3 install.py"
+        )
 
 
 def check_python() -> str:
@@ -119,7 +138,30 @@ def check_python() -> str:
 def check_systemd():
     if shutil.which("systemctl") is None:
         fatal("systemd not detected. This installer only supports systemd-based systems.")
-    ok("systemd available")
+    # Check that user session is available
+    result = run(["systemctl", "--user", "status"], check=False)
+    if result.returncode not in (0, 1, 3):
+        # returncode 3 = "no units" which is fine
+        warn("systemd --user may not be fully available. Continuing anyway.")
+    ok("systemd --user available")
+
+
+def check_lingering():
+    """Enable lingering so user services start on boot without login."""
+    user = os.environ.get("USER", getpass.getuser())
+    result = run(["loginctl", "show-user", user, "--property=Linger"], check=False)
+    if "Linger=yes" not in result.stdout:
+        info(f"Enabling lingering for user {user} (needed for boot auto-start) ...")
+        rc = run_live(["loginctl", "enable-linger", user], check=False)
+        if rc != 0:
+            warn(
+                "Failed to enable lingering. Service may not auto-start on boot.\n"
+                f"       Run manually: sudo loginctl enable-linger {user}"
+            )
+        else:
+            ok("Lingering enabled")
+    else:
+        ok("Lingering already enabled")
 
 
 def check_source():
@@ -132,46 +174,21 @@ def check_source():
 
 
 def step_check_env():
-    header("Step 1/6 · Environment checks")
-    check_root()
-    ok("Root privileges")
+    header("Step 1/5 · Environment checks")
+    check_not_root()
+    ok(f"Running as user: {getpass.getuser()}")
     python_path = check_python()
     check_systemd()
+    check_lingering()
     check_source()
     return python_path
 
 
-# ── Step 2: Create service user ───────────────────────────────────────────────
-
-
-def step_create_user():
-    header("Step 2/6 · Create service user")
-    try:
-        run(["id", SERVICE_USER])
-        ok(f"User {SERVICE_USER} already exists")
-    except subprocess.CalledProcessError:
-        info(f"Creating system user {SERVICE_USER} ...")
-        run(
-            [
-                "useradd",
-                "--system",
-                "--shell",
-                "/usr/sbin/nologin",
-                "--home-dir",
-                str(INSTALL_DIR),
-                "--no-create-home",
-                SERVICE_USER,
-            ]
-        )
-        run(["id", SERVICE_USER])
-        ok(f"User {SERVICE_USER} created")
-
-
-# ── Step 3: Deploy code ──────────────────────────────────────────────────────
+# ── Step 2: Deploy code ──────────────────────────────────────────────────────
 
 
 def step_deploy_code(python_path: str):
-    header("Step 3/6 · Deploy code & dependencies")
+    header("Step 2/5 · Deploy code & dependencies")
 
     if INSTALL_DIR.exists():
         if not ask_yes(f"{INSTALL_DIR} already exists. Overwrite code? (.env will be preserved)"):
@@ -197,17 +214,15 @@ def step_deploy_code(python_path: str):
     info("Creating Python virtual environment ...")
     if VENV_DIR.exists():
         shutil.rmtree(VENV_DIR)
-    run([python_path, "-m", "venv", str(VENV_DIR)])
+    run_live([python_path, "-m", "venv", str(VENV_DIR)])
     ok("Virtual environment created")
 
     pip = str(VENV_DIR / "bin" / "pip")
     req_file = dest_src / "requirements.txt"
 
-    info("Installing pip dependencies (this may take a moment) ...")
-    result = run([pip, "install", "-r", str(req_file)], check=False)
-    if result.returncode != 0:
-        err("pip install failed:")
-        print(result.stderr)
+    info("Installing pip dependencies ...")
+    rc = run_live([pip, "install", "-r", str(req_file)], check=False)
+    if rc != 0:
         fatal("Dependency installation failed. Check your network or pip mirror config.")
     ok("Dependencies installed")
 
@@ -218,12 +233,8 @@ def step_deploy_code(python_path: str):
         fatal("Verification failed: cannot import fastapi")
     ok(f"Verified: fastapi {result.stdout.strip()}")
 
-    run(["chown", "-R", f"{SERVICE_USER}:{SERVICE_USER}", str(INSTALL_DIR)])
-    run(["chmod", "750", str(INSTALL_DIR)])
-    ok("Directory permissions set")
 
-
-# ── Step 4: Interactive configuration ─────────────────────────────────────────
+# ── Step 3: Interactive configuration ─────────────────────────────────────────
 
 
 def generate_api_key() -> str:
@@ -231,8 +242,46 @@ def generate_api_key() -> str:
     return "kg-" + "".join(secrets.choice(alphabet) for _ in range(32))
 
 
+def detect_credentials() -> dict:
+    """
+    Scan the current user's home for known Kiro credential files.
+    Returns {"default_choice": "1"-"4", "detected_file": path_or_None}.
+    Priority: Kiro IDE JSON > kiro-cli SQLite > AWS SSO cache.
+    """
+    home = Path.home()
+
+    # Option 1: Kiro IDE JSON
+    kiro_json = home / ".aws" / "sso" / "cache" / "kiro-auth-token.json"
+    if kiro_json.is_file():
+        return {"default_choice": "1", "detected_file": str(kiro_json)}
+
+    # Option 3: kiro-cli SQLite
+    for db_path in [
+        home / ".local" / "share" / "kiro-cli" / "data.sqlite3",
+        home / ".local" / "share" / "amazon-q" / "data.sqlite3",
+    ]:
+        if db_path.is_file():
+            return {"default_choice": "3", "detected_file": str(db_path)}
+
+    # Option 4: AWS SSO cache (any JSON with accessToken + refreshToken)
+    sso_cache = home / ".aws" / "sso" / "cache"
+    if sso_cache.is_dir():
+        import json
+
+        for f in sorted(sso_cache.glob("*.json")):
+            try:
+                data = json.loads(f.read_text())
+                if "accessToken" in data and "refreshToken" in data:
+                    return {"default_choice": "4", "detected_file": str(f)}
+            except (json.JSONDecodeError, OSError):
+                continue
+
+    # Nothing found — default to option 1 (recommended)
+    return {"default_choice": "1", "detected_file": None}
+
+
 def step_configure():
-    header("Step 4/6 · Configure .env")
+    header("Step 3/5 · Configure .env")
 
     if ENV_FILE.exists():
         if not ask_yes("Existing .env found. Reconfigure?", default=False):
@@ -260,32 +309,48 @@ def step_configure():
     ok("PROXY_API_KEY set")
 
     # ── Credential source ──
+    detected = detect_credentials()
+    default_choice = detected["default_choice"]
+    detected_file = detected["detected_file"]
+
     print()
+    if detected_file:
+        ok(f"Detected credentials: {detected_file}")
     print(f"  {C.BOLD}Select Kiro credential source:{C.RESET}")
-    print(f"    {C.CYAN}1{C.RESET}  Kiro IDE credentials file (JSON)  — recommended, easiest")
+
+    tag = lambda n: f" {C.GREEN}← detected{C.RESET}" if n == default_choice else ""  # noqa: E731
     print(
-        f"    {C.CYAN}2{C.RESET}  Refresh Token (manual)             — extracted from IDE traffic"
+        f"    {C.CYAN}1{C.RESET}  Kiro IDE credentials file (JSON)  — recommended, easiest{tag('1')}"
     )
-    print(f"    {C.CYAN}3{C.RESET}  kiro-cli SQLite database            — for kiro-cli users")
-    print(f"    {C.CYAN}4{C.RESET}  AWS SSO cache file                  — enterprise SSO users")
+    print(
+        f"    {C.CYAN}2{C.RESET}  Refresh Token (manual)             — extracted from IDE traffic{tag('2')}"
+    )
+    print(
+        f"    {C.CYAN}3{C.RESET}  kiro-cli SQLite database            — for kiro-cli users{tag('3')}"
+    )
+    print(
+        f"    {C.CYAN}4{C.RESET}  AWS SSO cache file                  — enterprise SSO users{tag('4')}"
+    )
     print()
 
     while True:
-        choice = ask("Choose (1-4)", "1")
+        choice = ask("Choose (1-4)", default_choice)
         if choice in ("1", "2", "3", "4"):
             break
         warn("Please enter 1-4")
 
     if choice == "1":
-        default_creds = "~/.aws/sso/cache/kiro-auth-token.json"
+        default_creds = detected_file if default_choice == "1" and detected_file else ""
+        if not default_creds:
+            default_creds = "~/.aws/sso/cache/kiro-auth-token.json"
         creds_path = ask("Credentials file path", default_creds)
-        expanded = Path(creds_path).expanduser()
-        if not expanded.exists():
+        abs_path = str(Path(creds_path).expanduser().resolve())
+        if not Path(abs_path).exists():
             warn(
-                f"File {expanded} not found. It will be created automatically after Kiro IDE login."
+                f"File {abs_path} not found. It will be created automatically after Kiro IDE login."
             )
-        env_lines.append(f'KIRO_CREDS_FILE="{creds_path}"')
-        ok(f"Credential source: JSON file ({creds_path})")
+        env_lines.append(f'KIRO_CREDS_FILE="{abs_path}"')
+        ok(f"Credential source: JSON file ({abs_path})")
 
     elif choice == "2":
         token = ask_password("Enter your REFRESH_TOKEN")
@@ -295,18 +360,24 @@ def step_configure():
         ok("Credential source: Refresh Token")
 
     elif choice == "3":
-        default_db = "~/.local/share/kiro-cli/data.sqlite3"
+        default_db = detected_file if default_choice == "3" and detected_file else ""
+        if not default_db:
+            default_db = "~/.local/share/kiro-cli/data.sqlite3"
         db_path = ask("kiro-cli database path", default_db)
-        expanded = Path(db_path).expanduser()
-        if not expanded.exists():
-            warn(f"File {expanded} not found. Make sure you ran: kiro-cli login")
-        env_lines.append(f'KIRO_CLI_DB_FILE="{db_path}"')
-        ok(f"Credential source: SQLite ({db_path})")
+        abs_path = str(Path(db_path).expanduser().resolve())
+        if not Path(abs_path).exists():
+            warn(f"File {abs_path} not found. Make sure you ran: kiro-cli login")
+        env_lines.append(f'KIRO_CLI_DB_FILE="{abs_path}"')
+        ok(f"Credential source: SQLite ({abs_path})")
 
     elif choice == "4":
-        creds_path = ask("AWS SSO cache file path", "~/.aws/sso/cache/")
-        env_lines.append(f'KIRO_CREDS_FILE="{creds_path}"')
-        ok(f"Credential source: AWS SSO ({creds_path})")
+        default_sso = detected_file if default_choice == "4" and detected_file else ""
+        if not default_sso:
+            default_sso = "~/.aws/sso/cache/"
+        creds_path = ask("AWS SSO cache file path", default_sso)
+        abs_path = str(Path(creds_path).expanduser().resolve())
+        env_lines.append(f'KIRO_CREDS_FILE="{abs_path}"')
+        ok(f"Credential source: AWS SSO ({abs_path})")
 
     # ── Optional settings ──
     print()
@@ -329,8 +400,7 @@ def step_configure():
         env_lines.append('SERVER_PORT="8000"')
 
     ENV_FILE.write_text("\n".join(env_lines) + "\n")
-    run(["chown", f"{SERVICE_USER}:{SERVICE_USER}", str(ENV_FILE)])
-    run(["chmod", "600", str(ENV_FILE)])
+    os.chmod(str(ENV_FILE), 0o600)
 
     content = ENV_FILE.read_text()
     if "PROXY_API_KEY" not in content:
@@ -338,7 +408,7 @@ def step_configure():
     ok(".env written with permissions 600")
 
 
-# ── Step 5: Install systemd service ──────────────────────────────────────────
+# ── Step 4: Install systemd user service ─────────────────────────────────────
 
 
 def get_env_value(key: str, default: str) -> str:
@@ -350,7 +420,7 @@ def get_env_value(key: str, default: str) -> str:
 
 
 def step_install_service():
-    header("Step 5/6 · Install systemd service")
+    header("Step 4/5 · Install systemd user service")
 
     working_dir = INSTALL_DIR / "kiro-gateway"
     python_bin = VENV_DIR / "bin" / "python"
@@ -363,8 +433,6 @@ def step_install_service():
 
         [Service]
         Type=simple
-        User={SERVICE_USER}
-        Group={SERVICE_USER}
         WorkingDirectory={working_dir}
         EnvironmentFile={ENV_FILE}
         ExecStart={python_bin} main.py
@@ -373,82 +441,84 @@ def step_install_service():
         StartLimitIntervalSec=60
         StartLimitBurst=3
 
-        # Security hardening
-        NoNewPrivileges=true
-        ProtectSystem=strict
-        ProtectHome=read-only
-        PrivateTmp=true
-        ReadWritePaths={INSTALL_DIR}
-
         # Logging
         StandardOutput=journal
         StandardError=journal
         SyslogIdentifier={SERVICE_NAME}
 
         [Install]
-        WantedBy=multi-user.target
+        WantedBy=default.target
     """)
 
+    SERVICE_DIR.mkdir(parents=True, exist_ok=True)
     SERVICE_FILE.write_text(unit)
     ok(f"Service file written: {SERVICE_FILE}")
 
-    run(["systemctl", "daemon-reload"])
-    ok("systemctl daemon-reload")
+    run(["systemctl", "--user", "daemon-reload"])
+    ok("systemctl --user daemon-reload")
 
     # Enable for boot auto-start
-    result = run(["systemctl", "enable", SERVICE_NAME], check=False)
-    # Verify enable actually worked
-    verify = run(["systemctl", "is-enabled", SERVICE_NAME], check=False)
+    run(["systemctl", "--user", "enable", SERVICE_NAME], check=False)
+    verify = run(["systemctl", "--user", "is-enabled", SERVICE_NAME], check=False)
     if verify.stdout.strip() == "enabled":
-        ok("Boot auto-start enabled (systemctl is-enabled = enabled)")
+        ok("Boot auto-start enabled (systemctl --user is-enabled = enabled)")
     else:
-        warn(f"systemctl is-enabled returned: {verify.stdout.strip()}")
-        fatal("Failed to enable boot auto-start. Check systemd configuration.")
+        warn(f"systemctl --user is-enabled returned: {verify.stdout.strip()}")
+        fatal("Failed to enable boot auto-start.")
 
     # Start the service
     info("Starting service ...")
-    run(["systemctl", "restart", SERVICE_NAME], check=False)
+    run(["systemctl", "--user", "restart", SERVICE_NAME], check=False)
 
-    time.sleep(2)
-    result = run(["systemctl", "is-active", SERVICE_NAME], check=False)
-    if result.stdout.strip() == "active":
-        ok("Service is running (active)")
-    else:
-        warn("Service is not active. Fetching logs ...")
-        log_result = run(["journalctl", "-u", SERVICE_NAME, "-n", "20", "--no-pager"], check=False)
-        print(log_result.stdout)
-        fatal("Service failed to start. See logs above.")
+    info("Waiting for service to start ...")
+    for attempt in range(10):
+        time.sleep(1)
+        result = run(["systemctl", "--user", "is-active", SERVICE_NAME], check=False)
+        state = result.stdout.strip()
+        if state == "active":
+            ok("Service is running (active)")
+            return
+        if state == "failed":
+            break
+        print(f"    {C.DIM}state: {state} ({attempt + 1}/10){C.RESET}")
+
+    warn("Service is not active. Recent logs:")
+    run_live(["journalctl", "--user-unit", SERVICE_NAME, "-n", "30", "--no-pager"], check=False)
+    fatal("Service failed to start. See logs above.")
 
 
-# ── Step 6: Health check ─────────────────────────────────────────────────────
+# ── Step 5: Health check ─────────────────────────────────────────────────────
 
 
 def step_health_check():
-    header("Step 6/6 · Health check")
+    header("Step 5/5 · Health check")
 
     host = get_env_value("SERVER_HOST", "127.0.0.1")
     port = get_env_value("SERVER_PORT", "8000")
     url = f"http://{'127.0.0.1' if host == '0.0.0.0' else host}:{port}/health"
 
-    info(f"Waiting for service: {url}")
+    import urllib.error
+    import urllib.request
+
+    info(f"Polling {url}")
 
     for i in range(15):
         try:
-            import urllib.request
-
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=2) as resp:
                 if resp.status == 200:
                     ok(f"Health check passed (HTTP {resp.status})")
                     return True
-        except Exception:
-            pass
+        except urllib.error.URLError as e:
+            print(f"    {C.DIM}attempt {i + 1}/15 — {e.reason}{C.RESET}")
+        except Exception as e:
+            print(f"    {C.DIM}attempt {i + 1}/15 — {e}{C.RESET}")
         time.sleep(1)
-        print(f"  {C.DIM}  Waiting ... ({i+1}/15){C.RESET}", end="\r")
 
     print()
     warn(
-        "Health check timed out. The service may still be initializing (first start loads model list)."
+        "Health check timed out. The service may still be initializing "
+        "(first start loads model list)."
     )
     warn(f"Check manually later: curl {url}")
     return False
@@ -459,19 +529,18 @@ def step_health_check():
 
 def uninstall():
     header("Uninstall kiro-gateway")
-    check_root()
 
     if not ask_yes("Are you sure you want to uninstall kiro-gateway?", default=False):
         info("Cancelled")
         return
 
-    run(["systemctl", "stop", SERVICE_NAME], check=False)
-    run(["systemctl", "disable", SERVICE_NAME], check=False)
+    run(["systemctl", "--user", "stop", SERVICE_NAME], check=False)
+    run(["systemctl", "--user", "disable", SERVICE_NAME], check=False)
     ok("Service stopped and disabled")
 
     if SERVICE_FILE.exists():
         SERVICE_FILE.unlink()
-        run(["systemctl", "daemon-reload"])
+        run(["systemctl", "--user", "daemon-reload"])
         ok("Service file removed")
 
     keep_env = False
@@ -490,10 +559,6 @@ def uninstall():
         else:
             shutil.rmtree(INSTALL_DIR)
             ok("Install directory removed")
-
-    if ask_yes("Remove system user kiro-gateway?", default=True):
-        run(["userdel", SERVICE_USER], check=False)
-        ok("User removed")
 
     print()
     ok("Uninstall complete")
@@ -519,10 +584,10 @@ def print_summary():
   Auto-start:   {C.GREEN}enabled (starts on boot){C.RESET}
 
   {C.BOLD}Useful commands:{C.RESET}
-    Status     sudo systemctl status {SERVICE_NAME}
-    Logs       sudo journalctl -u {SERVICE_NAME} -f
-    Restart    sudo systemctl restart {SERVICE_NAME}
-    Edit cfg   sudo nano {ENV_FILE} && sudo systemctl restart {SERVICE_NAME}
+    Status     systemctl --user status {SERVICE_NAME}
+    Logs       journalctl --user-unit {SERVICE_NAME} -f
+    Restart    systemctl --user restart {SERVICE_NAME}
+    Edit cfg   nano {ENV_FILE} && systemctl --user restart {SERVICE_NAME}
 """)
 
 
@@ -537,7 +602,6 @@ def main():
         return
 
     python_path = step_check_env()
-    step_create_user()
     step_deploy_code(python_path)
     step_configure()
     step_install_service()
