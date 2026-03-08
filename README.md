@@ -24,26 +24,28 @@ install.py (no sudo needed)
 │   └── Source code present (git submodule)
 │
 ├── 2. Deploy code
-│   ├── Copy to ~/.local/share/kiro-gateway
-│   ├── Create Python venv + install deps (live output)
+│   ├── Copy source to ~/.local/share/kiro-gateway
+│   ├── Create Python venv (live output)
+│   ├── Install pip dependencies (live output)
 │   └── ✅ Verify: import fastapi succeeds
 │
 ├── 3. Interactive .env configuration
-│   ├── Auto-detect existing credential files on disk
 │   ├── Auto-generate or set PROXY_API_KEY
+│   ├── Auto-detect existing credential files on disk
 │   ├── Choose credential source (4 options, auto-detected default)
 │   ├── All paths expanded to absolute (no ~ issues)
 │   ├── Optional: port, proxy, region
-│   └── ✅ Verify: .env exists with required fields
+│   ├── ✅ Verify: .env exists with required fields
+│   └── ✅ Verify: .env permissions = 600
 │
 ├── 4. Install systemd user service
 │   ├── Generate unit file → ~/.config/systemd/user/
 │   ├── daemon-reload → enable → start
 │   ├── ✅ Verify: is-enabled = enabled (boot auto-start)
-│   └── ✅ Verify: is-active = active (with live status)
+│   └── ✅ Verify: is-active = active (live status polling)
 │
 └── 5. Health check
-    ├── Poll /health endpoint (up to 15s, shows each attempt)
+    ├── Poll /health endpoint (up to 15s, shows each attempt reason)
     └── ✅ Verify: HTTP 200
 ```
 
@@ -100,7 +102,7 @@ python3 tests/run_tests.py          # Run tests
 python3 tests/run_tests.py --keep   # Keep container for debugging
 ```
 
-Requires Docker. Tests cover: file creation, .env permissions, venv integrity, service enable/start, path expansion (no ~ in .env), and clean uninstall.
+Requires Docker. Tests cover: file creation, .env permissions and content, venv integrity, service enable/start, path expansion (no ~ in .env), full uninstall with zero-residue verification.
 
 CI runs automatically on push/PR via GitHub Actions.
 
