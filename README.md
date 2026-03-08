@@ -59,6 +59,14 @@ cd kiro-gateway-installer
 python3 install.py
 ```
 
+### Test model connectivity
+
+```bash
+python3 install.py --hello
+```
+
+Lists available models, lets you pick one, sends "Hello" and prints the reply. Quick way to verify the gateway and credentials are working end-to-end.
+
 ### Uninstall
 
 ```bash

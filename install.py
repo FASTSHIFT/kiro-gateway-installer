@@ -9,6 +9,7 @@ Uses systemctl --user for service management.
 Usage:
     python3 install.py              # Install
     python3 install.py --uninstall  # Uninstall
+    python3 install.py --hello      # Test model connectivity
 """
 
 import getpass
@@ -591,6 +592,94 @@ def print_summary():
 """)
 
 
+def hello():
+    """Send a test message to the gateway and print the model's reply."""
+    header("Hello — test model connectivity")
+
+    if not ENV_FILE.exists():
+        fatal(f"Config not found: {ENV_FILE}\n     Run python3 install.py first.")
+
+    host = get_env_value("SERVER_HOST", "127.0.0.1")
+    port = get_env_value("SERVER_PORT", "8000")
+    api_key = get_env_value("PROXY_API_KEY", "")
+    base = f"http://{'127.0.0.1' if host == '0.0.0.0' else host}:{port}"
+
+    if not api_key:
+        fatal("PROXY_API_KEY not found in .env")
+
+    # Check service is running
+    result = run(["systemctl", "--user", "is-active", SERVICE_NAME], check=False)
+    if result.stdout.strip() != "active":
+        fatal(f"Service is not running. Start it first: systemctl --user start {SERVICE_NAME}")
+
+    # List models
+    import json
+    import urllib.error
+    import urllib.request
+
+    info("Fetching available models ...")
+    try:
+        req = urllib.request.Request(
+            f"{base}/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            models = [m["id"] for m in data.get("data", [])]
+    except Exception as e:
+        fatal(f"Failed to list models: {e}")
+
+    if not models:
+        fatal("No models available.")
+
+    ok(f"Found {len(models)} model(s)")
+    for m in models[:10]:
+        print(f"    {C.DIM}{m}{C.RESET}")
+    if len(models) > 10:
+        print(f"    {C.DIM}... and {len(models) - 10} more{C.RESET}")
+
+    # Pick model
+    print()
+    model = ask("Model to use", models[0])
+
+    # Send hello
+    info(f"Sending 'Hello' to {model} ...")
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": "Hello! Reply in one short sentence."}],
+            "stream": False,
+        }
+    ).encode()
+
+    try:
+        req = urllib.request.Request(
+            f"{base}/v1/chat/completions",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode() if e.fp else ""
+        fatal(f"API error (HTTP {e.code}): {body}")
+    except Exception as e:
+        fatal(f"Request failed: {e}")
+
+    # Extract reply
+    try:
+        reply = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError):
+        fatal(f"Unexpected response format: {json.dumps(data, indent=2)}")
+
+    print()
+    ok(f"Model: {model}")
+    print(f"\n  {C.GREEN}💬 {reply}{C.RESET}\n")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
@@ -599,6 +688,10 @@ def main():
 
     if "--uninstall" in sys.argv:
         uninstall()
+        return
+
+    if "--hello" in sys.argv:
+        hello()
         return
 
     python_path = step_check_env()
